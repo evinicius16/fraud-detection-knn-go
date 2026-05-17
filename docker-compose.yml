@@ -22,14 +22,9 @@ services:
     image: evinicius16/fraud-detection-knn-go:v1
     environment:
       - PORT=8080
-      - IVF_INDEX_PATH=/shared/ivf_index.bin
+      - IVF_INDEX_PATH=/app/data/ivf_index.bin
       - MCC_RISK_PATH=/app/data/mcc_risk.json
       - NORMALIZATION_PATH=/app/data/normalization.json
-    volumes:
-      - shared-data:/shared:ro
-    depends_on:
-      data-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/ready"]
       interval: 2s
@@ -48,14 +43,9 @@ services:
     image: evinicius16/fraud-detection-knn-go:v1
     environment:
       - PORT=8080
-      - IVF_INDEX_PATH=/shared/ivf_index.bin
+      - IVF_INDEX_PATH=/app/data/ivf_index.bin
       - MCC_RISK_PATH=/app/data/mcc_risk.json
       - NORMALIZATION_PATH=/app/data/normalization.json
-    volumes:
-      - shared-data:/shared:ro
-    depends_on:
-      data-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/ready"]
       interval: 2s
@@ -69,22 +59,6 @@ services:
           memory: "170MB"
     networks:
       - rinha
-
-  data-init:
-    image: evinicius16/fraud-detection-knn-go:v1
-    entrypoint: ["sh", "-c", "cp /app/data/ivf_index.bin /shared/ivf_index.bin && echo 'Done'"]
-    volumes:
-      - shared-data:/shared
-    deploy:
-      resources:
-        limits:
-          cpus: "0.05"
-          memory: "20MB"
-    networks:
-      - rinha
-
-volumes:
-  shared-data:
 
 networks:
   rinha:
