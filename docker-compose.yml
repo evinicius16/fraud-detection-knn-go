@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   nginx:
     image: nginx:alpine
@@ -21,7 +19,7 @@ services:
       - rinha
 
   api1:
-    build: .
+    image: evinicius16/fraud-detection-knn-go:v1
     environment:
       - PORT=8080
       - IVF_INDEX_PATH=/shared/ivf_index.bin
@@ -37,7 +35,7 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
-      start_period: 20s
+      start_period: 5s
     deploy:
       resources:
         limits:
@@ -47,7 +45,7 @@ services:
       - rinha
 
   api2:
-    build: .
+    image: evinicius16/fraud-detection-knn-go:v1
     environment:
       - PORT=8080
       - IVF_INDEX_PATH=/shared/ivf_index.bin
@@ -63,7 +61,7 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
-      start_period: 20s
+      start_period: 5s
     deploy:
       resources:
         limits:
@@ -72,10 +70,9 @@ services:
     networks:
       - rinha
 
-  # Init container: copies the IVF index to the shared volume
   data-init:
-    build: .
-    entrypoint: ["sh", "-c", "cp /app/data/ivf_index.bin /shared/ivf_index.bin && echo 'IVF index copied to shared volume'"]
+    image: evinicius16/fraud-detection-knn-go:v1
+    entrypoint: ["sh", "-c", "cp /app/data/ivf_index.bin /shared/ivf_index.bin && echo 'Done'"]
     volumes:
       - shared-data:/shared
     deploy:
