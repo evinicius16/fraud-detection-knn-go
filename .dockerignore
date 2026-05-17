@@ -1,0 +1,7 @@
+bin/
+testdata/
+test/
+*.md
+.git/
+.gitignore
+Makefile
