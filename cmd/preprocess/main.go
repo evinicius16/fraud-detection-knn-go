@@ -2,35 +2,39 @@
 //
 // Strategy:
 // Level 1: Partition by 5 discrete dimensions (is_online, card_present,
-//           unknown_merchant, sentinel_5, sentinel_6) → up to 32 partitions.
-//           Routing is O(1) — just compute the partition key from the query bits.
 //
-// Level 2: Within each partition, run mini k-means (K=32) to create sub-clusters
-//           with bounding boxes for lower-bound pruning.
+//	unknown_merchant, sentinel_5, sentinel_6) → up to 32 partitions.
+//	Routing is O(1) — just compute the partition key from the query bits.
+//
+// Level 2: Within each partition, run mini k-means (K up to 128) to create
+//
+//	sub-clusters with bounding boxes for lower-bound pruning.
+//	More clusters = smaller clusters = faster scan per query.
 //
 // Dimensions are reordered: continuous dims sorted by variance (high first)
 // come before the discrete dims (which are used for partitioning, not distance).
-// Actually, since discrete dims are used for partitioning, vectors within a
-// partition all share the same discrete values → those dims contribute 0 to
-// intra-partition distances. We EXCLUDE them from the stored vectors entirely
-// (9 continuous dims only), saving memory and compute.
+// Since discrete dims are used for partitioning, vectors within a partition all
+// share the same discrete values → those dims contribute 0 to intra-partition
+// distances. We EXCLUDE them from the stored vectors entirely (9 continuous dims
+// only), saving memory and compute.
 //
 // Binary format:
-//   Header:
-//     4 bytes: numPartitions (uint32 LE)
-//     4 bytes: totalVectors (uint32 LE)
-//     4 bytes: numContinuousDims (uint32 LE) = 9
-//     9 * 4 bytes: continuousDimOrder (uint32 LE) — which original dims, in order
-//   Per partition (numPartitions times):
-//     4 bytes: partitionKey (uint32 LE) — the 5-bit key
-//     4 bytes: numVectors in this partition (uint32 LE)
-//     4 bytes: numClusters in this partition (uint32 LE)
-//     numClusters * 9 * 4 bytes: centroids (float32 LE)
-//     (numClusters + 1) * 4 bytes: clusterOffsets (uint32 LE, relative to partition start)
-//     numClusters * 9 * 2 bytes: bboxMin (int16 LE)
-//     numClusters * 9 * 2 bytes: bboxMax (int16 LE)
-//     numVectors * 9 * 2 bytes: vectors (int16 LE, ordered by cluster)
-//     numVectors bytes: labels
+//
+//	Header:
+//	  4 bytes: numPartitions (uint32 LE)
+//	  4 bytes: totalVectors (uint32 LE)
+//	  4 bytes: numContinuousDims (uint32 LE) = 9
+//	  9 * 4 bytes: continuousDimOrder (uint32 LE) — which original dims, in order
+//	Per partition (numPartitions times):
+//	  4 bytes: partitionKey (uint32 LE) — the 5-bit key
+//	  4 bytes: numVectors in this partition (uint32 LE)
+//	  4 bytes: numClusters in this partition (uint32 LE)
+//	  numClusters * 9 * 4 bytes: centroids (float32 LE)
+//	  (numClusters + 1) * 4 bytes: clusterOffsets (uint32 LE, relative to partition start)
+//	  numClusters * 9 * 2 bytes: bboxMin (int16 LE)
+//	  numClusters * 9 * 2 bytes: bboxMax (int16 LE)
+//	  numVectors * 9 * 2 bytes: vectors (int16 LE, ordered by cluster)
+//	  numVectors bytes: labels
 package main
 
 import (
@@ -47,19 +51,15 @@ import (
 )
 
 const (
-	origDim        = 14
-	contDim        = 9 // continuous dimensions (excluding 5 discrete)
-	scale          = 10000
-	clustersPerPart = 32
-	kmeansIters    = 15
+	origDim           = 14
+	contDim           = 9 // continuous dimensions (excluding 5 discrete)
+	scale             = 10000
+	clustersPerPart   = 128 // more clusters → smaller clusters → faster scan
+	kmeansIters       = 20  // more iterations → better cluster quality
+	minVecsPerCluster = 50  // target: ~50 vectors per cluster on average
 )
 
 // Discrete dimension indices (in original 14-dim space)
-// 5: minutes_since_last_tx (sentinel: -1 vs >=0)
-// 6: km_from_last_tx (sentinel: -1 vs >=0)
-// 9: is_online (0 or 1)
-// 10: card_present (0 or 1)
-// 11: unknown_merchant (0 or 1)
 var discreteDims = [5]int{9, 10, 11, 5, 6}
 
 // Continuous dimension indices (the other 9)
@@ -80,40 +80,29 @@ func main() {
 
 	fmt.Printf("[build] Reading %s...\n", inputPath)
 
-	// 1. Read all vectors
 	vectors, labels, count := readVectors(inputPath)
 	fmt.Printf("[build] Total: %d vectors\n", count)
 
-	// 2. Compute partition key for each vector
 	fmt.Println("[build] Computing partition keys...")
-	partitionKeys := make([]uint8, count)
-	partitionMap := make(map[uint8][]int) // key → vector indices
-
+	partitionMap := make(map[uint8][]int)
 	for i := 0; i < count; i++ {
 		key := computePartitionKey(vectors, i)
-		partitionKeys[i] = key
 		partitionMap[key] = append(partitionMap[key], i)
 	}
 	fmt.Printf("[build] Found %d unique partitions\n", len(partitionMap))
 
-	// 3. Extract continuous dims and compute variance-based ordering
 	fmt.Println("[build] Computing continuous dim variance ordering...")
 	contDimOrder := computeContinuousDimOrder(vectors, count)
 	fmt.Printf("[build] Continuous dim order (high variance first): %v\n", contDimOrder)
 
-	// 4. For each partition: extract vectors, run k-means, build index
 	fmt.Println("[build] Building per-partition IVF indices...")
 
-	// partitionData defined at package level below
-
-	// Sort partition keys for deterministic output
 	var sortedKeys []uint8
 	for k := range partitionMap {
 		sortedKeys = append(sortedKeys, k)
 	}
 	sort.Slice(sortedKeys, func(a, b int) bool { return sortedKeys[a] < sortedKeys[b] })
 
-	// partitionData used from package-level definition
 	partitions := make([]partitionData, 0, len(sortedKeys))
 
 	for _, key := range sortedKeys {
@@ -132,8 +121,8 @@ func main() {
 			partLabels[vi] = labels[origIdx]
 		}
 
-		// Determine number of clusters (min 1, max clustersPerPart, at least 50 per cluster)
-		numClusters := n / 200
+		// Target ~minVecsPerCluster vectors per cluster, capped at clustersPerPart
+		numClusters := n / minVecsPerCluster
 		if numClusters < 1 {
 			numClusters = 1
 		}
@@ -141,12 +130,10 @@ func main() {
 			numClusters = clustersPerPart
 		}
 
-		// Run k-means
 		centroids := make([]float32, numClusters*contDim)
 		assignments := make([]int, n)
 
 		if numClusters == 1 {
-			// Single cluster — just compute centroid
 			for vi := 0; vi < n; vi++ {
 				for d := 0; d < contDim; d++ {
 					centroids[d] += contVecs[vi*contDim+d]
@@ -156,7 +143,7 @@ func main() {
 				centroids[d] /= float32(n)
 			}
 		} else {
-			kmeansSimple(contVecs, n, centroids, assignments, numClusters)
+			kmeanspp(contVecs, n, centroids, assignments, numClusters)
 		}
 
 		// Reorder by cluster and quantize
@@ -225,12 +212,10 @@ func main() {
 			orderedLabels:  orderedLbls,
 		})
 
-		if n > 10000 {
-			fmt.Printf("[build]   partition %d: %d vectors, %d clusters\n", key, n, numClusters)
-		}
+		fmt.Printf("[build]   partition %02d: %6d vectors, %3d clusters (~%d/cluster)\n",
+			key, n, numClusters, n/numClusters)
 	}
 
-	// 5. Write binary
 	fmt.Printf("[build] Writing %s...\n", outputPath)
 	writeBinary(outputPath, partitions, contDimOrder, count)
 }
@@ -238,33 +223,25 @@ func main() {
 func computePartitionKey(vectors []float64, idx int) uint8 {
 	off := idx * origDim
 	var key uint8
-
-	// Bit 0: is_online (dim 9)
 	if vectors[off+9] > 0.5 {
 		key |= 1
 	}
-	// Bit 1: card_present (dim 10)
 	if vectors[off+10] > 0.5 {
 		key |= 2
 	}
-	// Bit 2: unknown_merchant (dim 11)
 	if vectors[off+11] > 0.5 {
 		key |= 4
 	}
-	// Bit 3: sentinel_5 (dim 5 == -1 means no last tx)
 	if vectors[off+5] < 0 {
 		key |= 8
 	}
-	// Bit 4: sentinel_6 (dim 6 == -1)
 	if vectors[off+6] < 0 {
 		key |= 16
 	}
-
 	return key
 }
 
 func computeContinuousDimOrder(vectors []float64, count int) []int {
-	// Compute variance for each continuous dim
 	means := make([]float64, contDim)
 	for i := 0; i < count; i++ {
 		off := i * origDim
@@ -285,7 +262,6 @@ func computeContinuousDimOrder(vectors []float64, count int) []int {
 		}
 	}
 
-	// Sort by variance descending
 	indices := make([]int, contDim)
 	for d := 0; d < contDim; d++ {
 		indices[d] = d
@@ -294,7 +270,6 @@ func computeContinuousDimOrder(vectors []float64, count int) []int {
 		return variances[indices[a]] > variances[indices[b]]
 	})
 
-	// Map back to original dim indices
 	result := make([]int, contDim)
 	for d := 0; d < contDim; d++ {
 		result[d] = continuousDims[indices[d]]
@@ -302,17 +277,57 @@ func computeContinuousDimOrder(vectors []float64, count int) []int {
 	return result
 }
 
-func kmeansSimple(vectors []float32, count int, centroids []float32, assignments []int, k int) {
+// kmeanspp runs k-means with k-means++ initialization for better cluster quality.
+// Better init → fewer iterations needed → more balanced clusters.
+func kmeanspp(vectors []float32, count int, centroids []float32, assignments []int, k int) {
 	rng := rand.New(rand.NewSource(42))
 
-	// Random init
-	for c := 0; c < k; c++ {
-		idx := rng.Intn(count)
-		copy(centroids[c*contDim:(c+1)*contDim], vectors[idx*contDim:(idx+1)*contDim])
+	// k-means++ init: pick first centroid randomly, then pick each subsequent
+	// centroid with probability proportional to squared distance from nearest centroid.
+	first := rng.Intn(count)
+	copy(centroids[0:contDim], vectors[first*contDim:(first+1)*contDim])
+
+	minDist := make([]float32, count)
+	for i := range minDist {
+		minDist[i] = math.MaxFloat32
 	}
 
+	for c := 1; c < k; c++ {
+		// Update min distances to nearest chosen centroid
+		prevCOff := (c - 1) * contDim
+		var totalDist float64
+		for i := 0; i < count; i++ {
+			vOff := i * contDim
+			var d float32
+			for dim := 0; dim < contDim; dim++ {
+				diff := vectors[vOff+dim] - centroids[prevCOff+dim]
+				d += diff * diff
+			}
+			if d < minDist[i] {
+				minDist[i] = d
+			}
+			totalDist += float64(minDist[i])
+		}
+
+		// Sample next centroid proportional to minDist^2
+		target := rng.Float64() * totalDist
+		var cumul float64
+		chosen := count - 1
+		for i := 0; i < count; i++ {
+			cumul += float64(minDist[i])
+			if cumul >= target {
+				chosen = i
+				break
+			}
+		}
+		copy(centroids[c*contDim:(c+1)*contDim], vectors[chosen*contDim:(chosen+1)*contDim])
+	}
+
+	// k-means iterations
 	for iter := 0; iter < kmeansIters; iter++ {
-		// Assign
+		changed := 0
+
+		// Assign each vector to nearest centroid
 		for i := 0; i < count; i++ {
 			bestC := 0
 			var bestDist float32 = math.MaxFloat32
@@ -329,10 +344,17 @@ func kmeansSimple(vectors []float32, count int, centroids []float32, assignments
 					bestC = c
 				}
 			}
-			assignments[i] = bestC
+			if assignments[i] != bestC {
+				assignments[i] = bestC
+				changed++
+			}
 		}
 
-		// Update
+		if changed == 0 {
+			break // converged
+		}
+
+		// Update centroids
 		sums := make([]float64, k*contDim)
 		counts := make([]int, k)
 		for i := 0; i < count; i++ {
@@ -402,7 +424,7 @@ func writeBinary(path string, partitions []partitionData, contDimOrder []int, to
 	}
 	defer f.Close()
 
-	w := bufio.NewWriterSize(f, 131072)
+	w := bufio.NewWriterSize(f, 1<<20) // 1MB write buffer
 	buf4 := make([]byte, 4)
 	buf2 := make([]byte, 2)
 
@@ -414,13 +436,11 @@ func writeBinary(path string, partitions []partitionData, contDimOrder []int, to
 	binary.LittleEndian.PutUint32(buf4, uint32(contDim))
 	w.Write(buf4)
 
-	// Continuous dim order
 	for d := 0; d < contDim; d++ {
 		binary.LittleEndian.PutUint32(buf4, uint32(contDimOrder[d]))
 		w.Write(buf4)
 	}
 
-	// Per partition
 	for _, p := range partitions {
 		binary.LittleEndian.PutUint32(buf4, uint32(p.key))
 		w.Write(buf4)
@@ -429,37 +449,31 @@ func writeBinary(path string, partitions []partitionData, contDimOrder []int, to
 		binary.LittleEndian.PutUint32(buf4, uint32(p.numClusters))
 		w.Write(buf4)
 
-		// Centroids
 		for i := 0; i < p.numClusters*contDim; i++ {
 			binary.LittleEndian.PutUint32(buf4, math.Float32bits(p.centroids[i]))
 			w.Write(buf4)
 		}
 
-		// Cluster offsets
 		for i := 0; i <= p.numClusters; i++ {
 			binary.LittleEndian.PutUint32(buf4, uint32(p.clusterOffsets[i]))
 			w.Write(buf4)
 		}
 
-		// BBox min
 		for i := 0; i < p.numClusters*contDim; i++ {
 			binary.LittleEndian.PutUint16(buf2, uint16(p.bboxMin[i]))
 			w.Write(buf2)
 		}
 
-		// BBox max
 		for i := 0; i < p.numClusters*contDim; i++ {
 			binary.LittleEndian.PutUint16(buf2, uint16(p.bboxMax[i]))
 			w.Write(buf2)
 		}
 
-		// Vectors
 		for i := 0; i < p.numVectors*contDim; i++ {
 			binary.LittleEndian.PutUint16(buf2, uint16(p.orderedVectors[i]))
 			w.Write(buf2)
 		}
 
-		// Labels
 		w.Write(p.orderedLabels)
 	}
 
@@ -467,14 +481,6 @@ func writeBinary(path string, partitions []partitionData, contDimOrder []int, to
 
 	fi, _ := f.Stat()
 	fmt.Printf("[build] Done! %s (%.1f MB)\n", path, float64(fi.Size())/(1024*1024))
-
-	// Stats
-	for _, p := range partitions {
-		if p.numVectors > 50000 {
-			fmt.Printf("[build]   partition %d: %d vectors, %d clusters (avg %d/cluster)\n",
-				p.key, p.numVectors, p.numClusters, p.numVectors/p.numClusters)
-		}
-	}
 }
 
 type partitionData struct {

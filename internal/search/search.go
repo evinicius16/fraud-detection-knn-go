@@ -61,21 +61,20 @@ func (idx *HybridIndex) FindFraudCount(query []float32) int {
 		q[d] = int16(val * 10000)
 	}
 
-	// 3. Find best 2 clusters (probing 2 clusters improves recall significantly)
+	// 3. Find best 2 clusters
 	best1, best2 := findTop2Clusters(part, qFloat)
 
-	// 4. Scan best cluster first, build top-5
+	// 4. Initialize top-5 heap
 	var d0, d1, d2, d3, d4 int64 = math.MaxInt64, math.MaxInt64, math.MaxInt64, math.MaxInt64, math.MaxInt64
 	var i0, i1, i2, i3, i4 int = -1, -1, -1, -1, -1
 
+	// 5. Scan best 2 clusters fully (no early exit — we need good initial d4)
 	scanCluster(part, &q, best1, &d0, &d1, &d2, &d3, &d4, &i0, &i1, &i2, &i3, &i4)
-
-	// 5. Scan second best cluster
 	if best2 >= 0 {
 		scanCluster(part, &q, best2, &d0, &d1, &d2, &d3, &d4, &i0, &i1, &i2, &i3, &i4)
 	}
 
-	// 6. Scan remaining clusters with bbox pruning
+	// 6. Scan remaining clusters with bbox lower-bound pruning + early exit
 	for c := 0; c < part.NumClusters; c++ {
 		if c == best1 || c == best2 {
 			continue
@@ -117,7 +116,6 @@ func (idx *HybridIndex) FindFraudCount(query []float32) int {
 }
 
 // findTop2Clusters returns the indices of the 2 closest centroids.
-// Returns (best, second) — second is -1 if there's only 1 cluster.
 func findTop2Clusters(part *Partition, qFloat [ContDim]float32) (int, int) {
 	best1, best2 := 0, -1
 	var dist1 float32 = math.MaxFloat32
@@ -158,30 +156,30 @@ func scanCluster(part *Partition, q *[ContDim]int16, c int,
 
 func computeQueryKey(query []float32) uint8 {
 	var key uint8
-	if query[9] > 0.5 { // is_online
+	if query[9] > 0.5 {
 		key |= 1
 	}
-	if query[10] > 0.5 { // card_present
+	if query[10] > 0.5 {
 		key |= 2
 	}
-	if query[11] > 0.5 { // unknown_merchant
+	if query[11] > 0.5 {
 		key |= 4
 	}
-	if query[5] < 0 { // sentinel_5 (minutes_since_last == -1)
+	if query[5] < 0 {
 		key |= 8
 	}
-	if query[6] < 0 { // sentinel_6 (km_from_last == -1)
+	if query[6] < 0 {
 		key |= 16
 	}
 	return key
 }
 
-// distSq9 computes squared distance for 9 continuous dimensions (fully unrolled).
+// distSq9 computes squared distance for 9 dims — fully unrolled, no bounds check.
 func distSq9(q *[ContDim]int16, vectors []int16, off int) int64 {
 	var sum int64
 	var diff int64
 	diff = int64(q[0]) - int64(vectors[off])
-	sum += diff * diff
+	sum = diff * diff
 	diff = int64(q[1]) - int64(vectors[off+1])
 	sum += diff * diff
 	diff = int64(q[2]) - int64(vectors[off+2])
@@ -201,13 +199,14 @@ func distSq9(q *[ContDim]int16, vectors []int16, off int) int64 {
 	return sum
 }
 
-// distSq9EarlyExit with aggressive early exit every 2 dims.
+// distSq9EarlyExit exits as soon as partial sum exceeds worst known distance.
+// Dims are ordered by variance (highest first) so early exit triggers sooner.
 func distSq9EarlyExit(q *[ContDim]int16, vectors []int16, off int, worst int64) int64 {
 	var sum int64
 	var diff int64
 
 	diff = int64(q[0]) - int64(vectors[off])
-	sum += diff * diff
+	sum = diff * diff
 	diff = int64(q[1]) - int64(vectors[off+1])
 	sum += diff * diff
 	if sum >= worst {
@@ -240,6 +239,8 @@ func distSq9EarlyExit(q *[ContDim]int16, vectors []int16, off int, worst int64) 
 	return sum
 }
 
+// bboxLB9 computes the lower-bound distance from query to a cluster's bounding box.
+// If the query is inside the bbox on a dimension, that dimension contributes 0.
 func bboxLB9(q *[ContDim]int16, bboxMin, bboxMax []int16, off int) int64 {
 	var sum int64
 	for d := 0; d < ContDim; d++ {
@@ -317,7 +318,6 @@ type Dataset struct {
 func (ds *Dataset) BruteForceKNN(query []float32) int {
 	dim := len(query)
 
-	// top-K using a max-heap of size K (worst distance at index 0)
 	topDist := [K]float32{math.MaxFloat32, math.MaxFloat32, math.MaxFloat32, math.MaxFloat32, math.MaxFloat32}
 	topIdx := [K]int{-1, -1, -1, -1, -1}
 	filled := 0
@@ -326,7 +326,6 @@ func (ds *Dataset) BruteForceKNN(query []float32) int {
 		d := euclideanDistSq(query, ds.Vectors[i*dim:(i+1)*dim])
 
 		if filled < K {
-			// Find position to insert (keep sorted descending so [0] is worst)
 			pos := filled
 			for pos > 0 && d > topDist[pos-1] {
 				topDist[pos] = topDist[pos-1]
@@ -337,10 +336,8 @@ func (ds *Dataset) BruteForceKNN(query []float32) int {
 			topIdx[pos] = i
 			filled++
 		} else if d < topDist[0] {
-			// Replace worst
 			topDist[0] = d
 			topIdx[0] = i
-			// Bubble down to maintain descending order
 			for j := 0; j+1 < K && topDist[j] < topDist[j+1]; j++ {
 				topDist[j], topDist[j+1] = topDist[j+1], topDist[j]
 				topIdx[j], topIdx[j+1] = topIdx[j+1], topIdx[j]
