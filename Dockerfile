@@ -10,11 +10,13 @@ RUN go mod download
 
 COPY . .
 
-# Build server
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /app/server ./cmd/server
+# Build server — optimize for speed on amd64, strip debug info
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-s -w" -gcflags="-B" -o /app/server ./cmd/server
 
-# Build preprocessor (IVF index builder)
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /app/preprocess ./cmd/preprocess
+# Build preprocessor
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-s -w" -o /app/preprocess ./cmd/preprocess
 
 # ============================================================
 # Stage 2: Build IVF index (JSON.gz → k-means + quantize + bbox)

@@ -1,8 +1,6 @@
 package vectorize
 
 import (
-	"time"
-
 	"github.com/evinicius16/fraud-detection-knn-go/internal/model"
 )
 
@@ -10,12 +8,12 @@ const VectorDim = 14
 
 // Normalization constants (from normalization.json)
 type NormConstants struct {
-	MaxAmount           float64 `json:"max_amount"`
-	MaxInstallments     float64 `json:"max_installments"`
-	AmountVsAvgRatio    float64 `json:"amount_vs_avg_ratio"`
-	MaxMinutes          float64 `json:"max_minutes"`
-	MaxKm               float64 `json:"max_km"`
-	MaxTxCount24h       float64 `json:"max_tx_count_24h"`
+	MaxAmount            float64 `json:"max_amount"`
+	MaxInstallments      float64 `json:"max_installments"`
+	AmountVsAvgRatio     float64 `json:"amount_vs_avg_ratio"`
+	MaxMinutes           float64 `json:"max_minutes"`
+	MaxKm                float64 `json:"max_km"`
+	MaxTxCount24h        float64 `json:"max_tx_count_24h"`
 	MaxMerchantAvgAmount float64 `json:"max_merchant_avg_amount"`
 }
 
@@ -67,6 +65,7 @@ func NewVectorizer(norm NormConstants, mccRisk MCCRisk) *Vectorizer {
 
 // Vectorize transforms a request into a 14-dimensional float32 vector.
 // The output is written into the provided dst slice (must have len >= 14).
+// Hot path: zero allocations, no time.Parse — uses manual ISO8601 parsing.
 func (v *Vectorizer) Vectorize(req *model.FraudRequest, dst []float32) {
 	norm := &v.Norm
 
@@ -83,23 +82,29 @@ func (v *Vectorizer) Vectorize(req *model.FraudRequest, dst []float32) {
 		dst[2] = clamp(float32(req.Transaction.Amount / norm.AmountVsAvgRatio))
 	}
 
-	// Parse requested_at for hour and day_of_week
-	t, err := time.Parse(time.RFC3339, req.Transaction.RequestedAt)
-	if err != nil {
-		// fallback: try without timezone
-		t, _ = time.Parse("2006-01-02T15:04:05Z", req.Transaction.RequestedAt)
-	}
+	// Parse requested_at without allocations — format: "2006-01-02T15:04:05Z" or with offset
+	// We only need hour (chars 11-12) and the full unix timestamp for diff.
+	reqTS := req.Transaction.RequestedAt
+	hour, reqUnix := parseTimestamp(reqTS)
 
 	// 3: hour_of_day (0-23 UTC, divided by 23)
-	dst[3] = float32(t.Hour()) / 23.0
+	dst[3] = float32(hour) / 23.0
 
-	// 4: day_of_week (mon=0, sun=6, divided by 6)
-	dow := int(t.Weekday()) // Sunday=0, Monday=1, ..., Saturday=6
+	// 4: day_of_week — derive from unix epoch (days since Thu 1970-01-01, weekday=4)
+	// epoch day: unix / 86400; weekday: (epochDay + 4) % 7 where Sun=0
+	epochDay := reqUnix / 86400
+	if reqUnix < 0 {
+		epochDay-- // floor division for negative
+	}
+	// Go weekday: Sun=0, Mon=1 ... Sat=6
+	goWeekday := int((epochDay + 4) % 7)
+	if goWeekday < 0 {
+		goWeekday += 7
+	}
 	// Convert to mon=0, sun=6
-	if dow == 0 {
-		dow = 6 // Sunday
-	} else {
-		dow = dow - 1 // Monday=0, Tuesday=1, ..., Saturday=5
+	dow := goWeekday - 1
+	if dow < 0 {
+		dow = 6
 	}
 	dst[4] = float32(dow) / 6.0
 
@@ -109,11 +114,9 @@ func (v *Vectorizer) Vectorize(req *model.FraudRequest, dst []float32) {
 		dst[5] = -1.0
 		dst[6] = -1.0
 	} else {
-		lastT, err := time.Parse(time.RFC3339, req.LastTransaction.Timestamp)
-		if err != nil {
-			lastT, _ = time.Parse("2006-01-02T15:04:05Z", req.LastTransaction.Timestamp)
-		}
-		minutes := t.Sub(lastT).Minutes()
+		_, lastUnix := parseTimestamp(req.LastTransaction.Timestamp)
+		diffSec := reqUnix - lastUnix
+		minutes := float64(diffSec) / 60.0
 		dst[5] = clamp(float32(minutes / norm.MaxMinutes))
 		dst[6] = clamp(float32(req.LastTransaction.KmFromCurrent / norm.MaxKm))
 	}
@@ -162,6 +165,60 @@ func (v *Vectorizer) Vectorize(req *model.FraudRequest, dst []float32) {
 
 	// 13: merchant_avg_amount
 	dst[13] = clamp(float32(req.Merchant.AvgAmount / norm.MaxMerchantAvgAmount))
+}
+
+// parseTimestamp parses an ISO8601/RFC3339 timestamp string without allocations.
+// Returns (hour int, unixSeconds int64).
+// Supports formats: "2006-01-02T15:04:05Z" and "2006-01-02T15:04:05+HH:MM"
+func parseTimestamp(s string) (hour int, unix int64) {
+	if len(s) < 19 {
+		return 0, 0
+	}
+
+	year := int(s[0]-'0')*1000 + int(s[1]-'0')*100 + int(s[2]-'0')*10 + int(s[3]-'0')
+	month := int(s[5]-'0')*10 + int(s[6]-'0')
+	day := int(s[8]-'0')*10 + int(s[9]-'0')
+	hour = int(s[11]-'0')*10 + int(s[12]-'0')
+	minute := int(s[14]-'0')*10 + int(s[15]-'0')
+	second := int(s[17]-'0')*10 + int(s[18]-'0')
+
+	// Parse timezone offset in seconds
+	tzOffsetSec := 0
+	if len(s) > 19 {
+		c := s[19]
+		if c == '+' || c == '-' {
+			if len(s) >= 25 {
+				tzH := int(s[20]-'0')*10 + int(s[21]-'0')
+				tzM := int(s[23]-'0')*10 + int(s[24]-'0')
+				tzOffsetSec = tzH*3600 + tzM*60
+				if c == '-' {
+					tzOffsetSec = -tzOffsetSec
+				}
+			}
+		}
+		// 'Z' means UTC, offset = 0
+	}
+
+	// Compute unix timestamp using civil-time → epoch algorithm
+	unix = civilToUnix(year, month, day, hour, minute, second) - int64(tzOffsetSec)
+	return hour, unix
+}
+
+// civilToUnix converts a UTC civil time to Unix seconds.
+// Uses the algorithm from http://howardhinnant.github.io/date_algorithms.html
+func civilToUnix(year, month, day, hour, minute, second int) int64 {
+	if month <= 2 {
+		year--
+	}
+	era := year / 400
+	if year < 0 {
+		era = (year - 399) / 400
+	}
+	yoe := year - era*400                           // [0, 399]
+	doy := (153*(month+9)%12+2)/5 + day - 1         // [0, 365]
+	doe := yoe*365 + yoe/4 - yoe/100 + doy          // [0, 146096]
+	days := int64(era)*146097 + int64(doe) - 719468 // days since epoch
+	return days*86400 + int64(hour)*3600 + int64(minute)*60 + int64(second)
 }
 
 func clamp(x float32) float32 {

@@ -34,12 +34,12 @@ type HybridIndex struct {
 // FindFraudCount routes the query to the correct partition and searches.
 // query is the full 14-dim vector in original order.
 func (idx *HybridIndex) FindFraudCount(query []float32) int {
-	// 1. Compute partition key from discrete dims (O(1) routing!)
+	// 1. Compute partition key from discrete dims (O(1) routing)
 	key := computeQueryKey(query)
 
 	part := idx.Partitions[key]
 	if part == nil || part.NumVectors == 0 {
-		// Fallback: try nearest partition (flip least significant bit)
+		// Fallback: try nearest partition by flipping bits one at a time
 		for flip := uint8(1); flip < 32; flip++ {
 			alt := key ^ flip
 			if idx.Partitions[alt] != nil && idx.Partitions[alt].NumVectors > 0 {
@@ -61,39 +61,23 @@ func (idx *HybridIndex) FindFraudCount(query []float32) int {
 		q[d] = int16(val * 10000)
 	}
 
-	// 3. Find best cluster
-	bestCluster := 0
-	var bestDist float32 = math.MaxFloat32
-	for c := 0; c < part.NumClusters; c++ {
-		off := c * ContDim
-		var dist float32
-		for d := 0; d < ContDim; d++ {
-			diff := qFloat[d] - part.Centroids[off+d]
-			dist += diff * diff
-		}
-		if dist < bestDist {
-			bestDist = dist
-			bestCluster = c
-		}
-	}
+	// 3. Find best 2 clusters (probing 2 clusters improves recall significantly)
+	best1, best2 := findTop2Clusters(part, qFloat)
 
-	// 4. Scan best cluster, build top-5
+	// 4. Scan best cluster first, build top-5
 	var d0, d1, d2, d3, d4 int64 = math.MaxInt64, math.MaxInt64, math.MaxInt64, math.MaxInt64, math.MaxInt64
 	var i0, i1, i2, i3, i4 int = -1, -1, -1, -1, -1
 
-	start := part.ClusterOffsets[bestCluster]
-	end := part.ClusterOffsets[bestCluster+1]
+	scanCluster(part, &q, best1, &d0, &d1, &d2, &d3, &d4, &i0, &i1, &i2, &i3, &i4)
 
-	for vi := start; vi < end; vi++ {
-		dist := distSq9(&q, part.Vectors, vi*ContDim)
-		if dist < d4 {
-			insertTop5(dist, vi, &d0, &d1, &d2, &d3, &d4, &i0, &i1, &i2, &i3, &i4)
-		}
+	// 5. Scan second best cluster
+	if best2 >= 0 {
+		scanCluster(part, &q, best2, &d0, &d1, &d2, &d3, &d4, &i0, &i1, &i2, &i3, &i4)
 	}
 
-	// 5. Scan other clusters with bbox pruning
+	// 6. Scan remaining clusters with bbox pruning
 	for c := 0; c < part.NumClusters; c++ {
-		if c == bestCluster {
+		if c == best1 || c == best2 {
 			continue
 		}
 
@@ -102,9 +86,8 @@ func (idx *HybridIndex) FindFraudCount(query []float32) int {
 			continue
 		}
 
-		start = part.ClusterOffsets[c]
-		end = part.ClusterOffsets[c+1]
-
+		start := part.ClusterOffsets[c]
+		end := part.ClusterOffsets[c+1]
 		for vi := start; vi < end; vi++ {
 			dist := distSq9EarlyExit(&q, part.Vectors, vi*ContDim, d4)
 			if dist < d4 {
@@ -113,7 +96,7 @@ func (idx *HybridIndex) FindFraudCount(query []float32) int {
 		}
 	}
 
-	// 6. Count frauds
+	// 7. Count frauds among top-5
 	fraudCount := 0
 	if i0 >= 0 && part.Labels[i0] {
 		fraudCount++
@@ -131,6 +114,46 @@ func (idx *HybridIndex) FindFraudCount(query []float32) int {
 		fraudCount++
 	}
 	return fraudCount
+}
+
+// findTop2Clusters returns the indices of the 2 closest centroids.
+// Returns (best, second) — second is -1 if there's only 1 cluster.
+func findTop2Clusters(part *Partition, qFloat [ContDim]float32) (int, int) {
+	best1, best2 := 0, -1
+	var dist1 float32 = math.MaxFloat32
+	var dist2 float32 = math.MaxFloat32
+
+	for c := 0; c < part.NumClusters; c++ {
+		off := c * ContDim
+		var dist float32
+		for d := 0; d < ContDim; d++ {
+			diff := qFloat[d] - part.Centroids[off+d]
+			dist += diff * diff
+		}
+		if dist < dist1 {
+			dist2 = dist1
+			best2 = best1
+			dist1 = dist
+			best1 = c
+		} else if dist < dist2 {
+			dist2 = dist
+			best2 = c
+		}
+	}
+	return best1, best2
+}
+
+// scanCluster scans all vectors in cluster c and updates the top-5 heap.
+func scanCluster(part *Partition, q *[ContDim]int16, c int,
+	d0, d1, d2, d3, d4 *int64, i0, i1, i2, i3, i4 *int) {
+	start := part.ClusterOffsets[c]
+	end := part.ClusterOffsets[c+1]
+	for vi := start; vi < end; vi++ {
+		dist := distSq9(q, part.Vectors, vi*ContDim)
+		if dist < *d4 {
+			insertTop5(dist, vi, d0, d1, d2, d3, d4, i0, i1, i2, i3, i4)
+		}
+	}
 }
 
 func computeQueryKey(query []float32) uint8 {
@@ -153,7 +176,7 @@ func computeQueryKey(query []float32) uint8 {
 	return key
 }
 
-// distSq9 computes squared distance for 9 continuous dimensions.
+// distSq9 computes squared distance for 9 continuous dimensions (fully unrolled).
 func distSq9(q *[ContDim]int16, vectors []int16, off int) int64 {
 	var sum int64
 	var diff int64
@@ -183,34 +206,30 @@ func distSq9EarlyExit(q *[ContDim]int16, vectors []int16, off int, worst int64) 
 	var sum int64
 	var diff int64
 
-	// Dims 0-1 (highest variance)
 	diff = int64(q[0]) - int64(vectors[off])
 	sum += diff * diff
 	diff = int64(q[1]) - int64(vectors[off+1])
 	sum += diff * diff
-	if sum > worst {
+	if sum >= worst {
 		return math.MaxInt64
 	}
 
-	// Dims 2-3
 	diff = int64(q[2]) - int64(vectors[off+2])
 	sum += diff * diff
 	diff = int64(q[3]) - int64(vectors[off+3])
 	sum += diff * diff
-	if sum > worst {
+	if sum >= worst {
 		return math.MaxInt64
 	}
 
-	// Dims 4-5
 	diff = int64(q[4]) - int64(vectors[off+4])
 	sum += diff * diff
 	diff = int64(q[5]) - int64(vectors[off+5])
 	sum += diff * diff
-	if sum > worst {
+	if sum >= worst {
 		return math.MaxInt64
 	}
 
-	// Dims 6-7-8
 	diff = int64(q[6]) - int64(vectors[off+6])
 	sum += diff * diff
 	diff = int64(q[7]) - int64(vectors[off+7])
@@ -240,25 +259,40 @@ func bboxLB9(q *[ContDim]int16, bboxMin, bboxMax []int16, off int) int64 {
 
 func insertTop5(dist int64, idx int, d0, d1, d2, d3, d4 *int64, i0, i1, i2, i3, i4 *int) {
 	if dist < *d0 {
-		*d4 = *d3; *i4 = *i3
-		*d3 = *d2; *i3 = *i2
-		*d2 = *d1; *i2 = *i1
-		*d1 = *d0; *i1 = *i0
-		*d0 = dist; *i0 = idx
+		*d4 = *d3
+		*i4 = *i3
+		*d3 = *d2
+		*i3 = *i2
+		*d2 = *d1
+		*i2 = *i1
+		*d1 = *d0
+		*i1 = *i0
+		*d0 = dist
+		*i0 = idx
 	} else if dist < *d1 {
-		*d4 = *d3; *i4 = *i3
-		*d3 = *d2; *i3 = *i2
-		*d2 = *d1; *i2 = *i1
-		*d1 = dist; *i1 = idx
+		*d4 = *d3
+		*i4 = *i3
+		*d3 = *d2
+		*i3 = *i2
+		*d2 = *d1
+		*i2 = *i1
+		*d1 = dist
+		*i1 = idx
 	} else if dist < *d2 {
-		*d4 = *d3; *i4 = *i3
-		*d3 = *d2; *i3 = *i2
-		*d2 = dist; *i2 = idx
+		*d4 = *d3
+		*i4 = *i3
+		*d3 = *d2
+		*i3 = *i2
+		*d2 = dist
+		*i2 = idx
 	} else if dist < *d3 {
-		*d4 = *d3; *i4 = *i3
-		*d3 = dist; *i3 = idx
+		*d4 = *d3
+		*i4 = *i3
+		*d3 = dist
+		*i3 = idx
 	} else {
-		*d4 = dist; *i4 = idx
+		*d4 = dist
+		*i4 = idx
 	}
 }
 
@@ -277,4 +311,58 @@ type Dataset struct {
 	Vectors []float32
 	Labels  []bool
 	Count   int
+}
+
+// BruteForceKNN performs exact KNN search over the dataset (used in tests).
+func (ds *Dataset) BruteForceKNN(query []float32) int {
+	dim := len(query)
+
+	// top-K using a max-heap of size K (worst distance at index 0)
+	topDist := [K]float32{math.MaxFloat32, math.MaxFloat32, math.MaxFloat32, math.MaxFloat32, math.MaxFloat32}
+	topIdx := [K]int{-1, -1, -1, -1, -1}
+	filled := 0
+
+	for i := 0; i < ds.Count; i++ {
+		d := euclideanDistSq(query, ds.Vectors[i*dim:(i+1)*dim])
+
+		if filled < K {
+			// Find position to insert (keep sorted descending so [0] is worst)
+			pos := filled
+			for pos > 0 && d > topDist[pos-1] {
+				topDist[pos] = topDist[pos-1]
+				topIdx[pos] = topIdx[pos-1]
+				pos--
+			}
+			topDist[pos] = d
+			topIdx[pos] = i
+			filled++
+		} else if d < topDist[0] {
+			// Replace worst
+			topDist[0] = d
+			topIdx[0] = i
+			// Bubble down to maintain descending order
+			for j := 0; j+1 < K && topDist[j] < topDist[j+1]; j++ {
+				topDist[j], topDist[j+1] = topDist[j+1], topDist[j]
+				topIdx[j], topIdx[j+1] = topIdx[j+1], topIdx[j]
+			}
+		}
+	}
+
+	fraudCount := 0
+	for k := 0; k < filled; k++ {
+		if topIdx[k] >= 0 && ds.Labels[topIdx[k]] {
+			fraudCount++
+		}
+	}
+	return fraudCount
+}
+
+// euclideanDistSq computes squared Euclidean distance between two float32 slices.
+func euclideanDistSq(a, b []float32) float32 {
+	var sum float32
+	for i := range a {
+		diff := a[i] - b[i]
+		sum += diff * diff
+	}
+	return sum
 }

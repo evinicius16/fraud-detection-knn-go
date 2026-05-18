@@ -19,7 +19,7 @@ services:
       - rinha
 
   api1:
-    image: evinicius16/fraud-detection-knn-go:v1
+    image: evinicius16/fraud-detection-knn-go:v2
     environment:
       - PORT=8080
       - IVF_INDEX_PATH=/app/data/ivf_index.bin
@@ -40,7 +40,7 @@ services:
       - rinha
 
   api2:
-    image: evinicius16/fraud-detection-knn-go:v1
+    image: evinicius16/fraud-detection-knn-go:v2
     environment:
       - PORT=8080
       - IVF_INDEX_PATH=/app/data/ivf_index.bin
