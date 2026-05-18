@@ -1,4 +1,4 @@
-services:
+cdservices:
   nginx:
     image: nginx:alpine
     volumes:
